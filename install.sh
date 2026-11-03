@@ -337,6 +337,19 @@ my @incumbent = lstat($destination);
 if (@incumbent && !S_ISREG($incumbent[2])) {
     die "Refusing to replace a non-regular or symlink destination: $destination\n";
 }
+# Reinstalling identical bytes (e.g. a nightly update with no new release)
+# changes nothing, so it must not leave a backup or a candidate behind.
+if (@incumbent && ($incumbent[2] & 0777) == 0755 && digest($destination) eq digest($source)) {
+    print STDERR "Already current: $destination matches the installer source; nothing replaced\n";
+    exit 0;
+}
+# One backup of the immediately preceding version, under a fixed name, so
+# repeated upgrades replace it instead of accumulating copies.
+my $backup_path = "$directory/.$name-previous";
+my @backup_stat = lstat($backup_path);
+if (@incumbent && @backup_stat && !S_ISREG($backup_stat[2])) {
+    die "Refusing to replace a non-regular or symlink backup path: $backup_path\n";
+}
 sysopen(my $input, $source, O_RDONLY | O_NOFOLLOW) or die "Cannot read source $source: $!\n";
 binmode($input) or die "Cannot read raw installer source: $!\n";
 my @input_stat = stat($input);
@@ -359,12 +372,26 @@ if (@incumbent) {
         or die "Incumbent changed before preservation\n";
     my ($backup_file, $backup) = tempfile(".$name-previous.XXXXXX", DIR => $directory, UNLINK => 0);
     binmode($backup_file) or die "Cannot preserve raw incumbent bytes: $!\n";
-    print STDERR "Retaining incumbent backup: $backup\n";
     copy($previous, $backup_file) or die "Cannot preserve incumbent $backup: $!\n";
     close($previous) or die "Cannot close incumbent: $!\n";
     close($backup_file) or die "Cannot finish incumbent backup: $!\n";
     chmod($incumbent[2] & 0777, $backup) == 1 or die "Cannot preserve incumbent permissions: $!\n";
     digest($backup) eq digest($destination) or die "Incumbent changed during preservation\n";
+    # Only a complete, verified copy replaces the previous backup; on any
+    # failure above, the partial copy and the older backup are both retained.
+    my @current_backup = lstat($backup_path);
+    if (@current_backup && !S_ISREG($current_backup[2])) {
+        die "Refusing to replace a non-regular or symlink backup path: $backup_path\n";
+    }
+    rename($backup, $backup_path) or die "Cannot keep incumbent backup at $backup_path: $!\n";
+    print STDERR "Kept the previous version as $backup_path\n";
+    opendir(my $listing, $directory) or die "Cannot list $directory: $!\n";
+    my @legacy = grep { /^\Q.$name-previous.\E/ && -f "$directory/$_" && !-l "$directory/$_" } readdir($listing);
+    closedir($listing);
+    if (@legacy) {
+        printf STDERR "Note: %d older backup(s) named .%s-previous.* from earlier installs remain in %s;" .
+            " they are not removed automatically\n", scalar(@legacy), $name, $directory;
+    }
 }
 my @current = lstat($destination);
 if (@incumbent) {

@@ -786,26 +786,73 @@ test_public_installer_workflow() {
     assert_equals "$link_target" "$(readlink "$symlink_dest/asb")" || return 1
     assert_equals "keep-link-target" "$(cat "$link_target")" || return 1
 
+    # Issue #7: an identical reinstall (a nightly update with no new release)
+    # must change nothing and leave no backup or candidate behind.
     local upgrade_dir="${TEST_ENV_ROOT}/repeat-install"
     mkdir -p "$upgrade_dir" || return 1
     cp -p "$pinned_dir/asb" "$upgrade_dir/asb" || return 1
     local previous_inode
     previous_inode=$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$upgrade_dir/asb") || return 1
-    ( source "$installer"; install_script "$pinned_dir/asb" "$upgrade_dir" ) || return 1
+    local repeat
+    for repeat in 1 2 3; do
+        output=$( source "$installer"; install_script "$pinned_dir/asb" "$upgrade_dir" 2>&1 ) || {
+            log_error "Identical reinstall $repeat failed: $output"; return 1;
+        }
+        assert_contains "$output" "Already current" || return 1
+    done
     python3 - "$upgrade_dir" "$expected" "$previous_inode" <<'PY' || return 1
 import hashlib, os, pathlib, stat, sys
 directory = pathlib.Path(sys.argv[1])
 current = directory / "asb"
-assert current.stat().st_ino != int(sys.argv[3]), "Publication must replace the prepared inode"
-backups = list(directory.glob(".asb-previous.*"))
-assert len(backups) == 1, "Repeat install must retain exactly one incumbent backup"
-for path in (current, backups[0]):
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == sys.argv[2]
-    assert stat.S_IMODE(path.stat().st_mode) == 0o755
-assert not list(directory.glob(".asb-install.*")), "The complete candidate must be published"
+assert current.stat().st_ino == int(sys.argv[3]), "An identical reinstall must not replace the incumbent"
+assert hashlib.sha256(current.read_bytes()).hexdigest() == sys.argv[2]
+assert stat.S_IMODE(current.stat().st_mode) == 0o755
+assert not list(directory.glob(".asb-previous*")), "An identical reinstall must not create a backup"
+# The kernel lock file (.asb-install.lock) persists by design; candidates are .asb-install.XXXXXX.
+assert not [p for p in directory.glob(".asb-install.*") if p.name != ".asb-install.lock"], "An identical reinstall must not leave a candidate"
 PY
     output=$("$upgrade_dir/asb" version) || return 1
     assert_equals "asb version ${tag#v}" "$output" || return 1
+
+    # A real upgrade keeps exactly one backup, at a fixed name, holding the
+    # version it replaced; a later upgrade replaces that backup. Backups left
+    # by earlier installers are reported and never removed.
+    local rotate_dir="${TEST_ENV_ROOT}/rotating-backup"
+    mkdir -p "$rotate_dir" || return 1
+    printf 'legacy-backup\n' > "$rotate_dir/.asb-previous.LEGACY1" || return 1
+    local rotate_real generation
+    rotate_real=$(cd -- "$rotate_dir" && pwd -P) || return 1
+    for generation in first second; do
+        { cat "$pinned_dir/asb"; printf '\n# older build: %s\n' "$generation"; } > "$rotate_dir/asb" || return 1
+        chmod 755 "$rotate_dir/asb" || return 1
+        cp -p "$rotate_dir/asb" "${TEST_ENV_ROOT}/incumbent-$generation" || return 1
+        output=$( source "$installer"; install_script "$pinned_dir/asb" "$rotate_dir" 2>&1 ) || return 1
+        assert_contains "$output" "Kept the previous version as $rotate_real/.asb-previous" || return 1
+        assert_contains "$output" "1 older backup(s) named .asb-previous.*" || return 1
+        cmp "$pinned_dir/asb" "$rotate_dir/asb" || return 1
+        cmp "${TEST_ENV_ROOT}/incumbent-$generation" "$rotate_dir/.asb-previous" || return 1
+    done
+    python3 - "$rotate_dir" <<'PY' || return 1
+import pathlib, stat, sys
+directory = pathlib.Path(sys.argv[1])
+names = sorted(p.name for p in directory.glob(".asb-previous*"))
+assert names == [".asb-previous", ".asb-previous.LEGACY1"], names
+assert (directory / ".asb-previous.LEGACY1").read_text() == "legacy-backup\n"
+assert stat.S_IMODE((directory / ".asb-previous").stat().st_mode) == 0o755
+assert not [p for p in directory.glob(".asb-install.*") if p.name != ".asb-install.lock"], "The complete candidate must be published"
+PY
+
+    local backup_dir_case="${TEST_ENV_ROOT}/directory-backup-path"
+    mkdir -p "$backup_dir_case/.asb-previous" || return 1
+    { cat "$pinned_dir/asb"; printf '\n# older build\n'; } > "$backup_dir_case/asb" || return 1
+    chmod 755 "$backup_dir_case/asb" || return 1
+    cp -p "$backup_dir_case/asb" "${TEST_ENV_ROOT}/incumbent-directory-case" || return 1
+    if output=$( source "$installer"; install_script "$pinned_dir/asb" "$backup_dir_case" 2>&1 ); then
+        log_error "A non-regular backup path was replaced"; return 1
+    fi
+    assert_contains "$output" "Refusing to replace a non-regular or symlink backup path" || return 1
+    cmp "${TEST_ENV_ROOT}/incumbent-directory-case" "$backup_dir_case/asb" || return 1
+    [[ -d "$backup_dir_case/.asb-previous" ]] || return 1
 
     local contention_dir="${TEST_ENV_ROOT}/kernel-lock-contention"
     mkdir -p "$contention_dir" || return 1
@@ -828,8 +875,8 @@ with (directory / ".asb-install.lock").open("a") as lock:
     assert incumbent.read_bytes() == before[0]
     assert incumbent.stat().st_ino == before[1].st_ino
     assert incumbent.stat().st_mode == before[1].st_mode
-    assert not list(directory.glob(".asb-install.*"))
-    assert not list(directory.glob(".asb-previous.*"))
+    assert not [p for p in directory.glob(".asb-install.*") if p.name != ".asb-install.lock"]
+    assert not list(directory.glob(".asb-previous*"))
 # The real parent lock closes naturally; the same install must now succeed.
 PY
     ( source "$installer"; install_script "$pinned_dir/asb" "$contention_dir" ) || return 1
@@ -851,7 +898,11 @@ PY
     local failed_dir="${TEST_ENV_ROOT}/kernel-copy-failure"
     local failed_upgrade_dir="${TEST_ENV_ROOT}/kernel-upgrade-failure"
     mkdir -p "$failed_upgrade_dir" || return 1
-    cp -p "$pinned_dir/asb" "$failed_upgrade_dir/asb" || return 1
+    # The incumbent differs from the source, so this is a real upgrade (an
+    # identical incumbent is now a no-op and never reaches the copy).
+    { cat "$pinned_dir/asb"; printf '\n# older build\n'; } > "$failed_upgrade_dir/asb" || return 1
+    chmod 755 "$failed_upgrade_dir/asb" || return 1
+    cp -p "$failed_upgrade_dir/asb" "${TEST_ENV_ROOT}/incumbent-failed-upgrade" || return 1
     previous_inode=$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$failed_upgrade_dir/asb") || return 1
     local failure_destination
     for failure_destination in "$failed_dir" "$failed_upgrade_dir"; do
@@ -876,13 +927,14 @@ PY
         assert_contains "$output" "Failed to install asb" || return 1
         python3 - "$failure_destination" <<'PY' || return 1
 import pathlib, sys
-candidates = list(pathlib.Path(sys.argv[1]).glob(".asb-install.*"))
+candidates = [p for p in pathlib.Path(sys.argv[1]).glob(".asb-install.*") if p.name != ".asb-install.lock"]
 assert len(candidates) == 1, "The failed preparation must retain its actual partial file"
 assert candidates[0].stat().st_size == 0
 PY
     done
     assert_file_not_exists "$failed_dir/asb" || return 1
-    cmp "$pinned_dir/asb" "$failed_upgrade_dir/asb" || return 1
+    cmp "${TEST_ENV_ROOT}/incumbent-failed-upgrade" "$failed_upgrade_dir/asb" || return 1
+    [[ ! -e "$failed_upgrade_dir/.asb-previous" ]] || return 1
     python3 -c 'import os,sys; assert os.stat(sys.argv[1]).st_ino == int(sys.argv[2])' "$failed_upgrade_dir/asb" "$previous_inode" || return 1
     mode=$(stat -c%a "$failed_upgrade_dir/asb" 2>/dev/null || stat -f%Lp "$failed_upgrade_dir/asb") || return 1
     assert_equals "755" "$mode" || return 1
