@@ -854,6 +854,87 @@ PY
     cmp "${TEST_ENV_ROOT}/incumbent-directory-case" "$backup_dir_case/asb" || return 1
     [[ -d "$backup_dir_case/.asb-previous" ]] || return 1
 
+    # Identical bytes with another mode are repaired, not backed up: a copy of
+    # the current version must not replace the older one in the backup.
+    local mode_repair_dir="${TEST_ENV_ROOT}/mode-repair"
+    mkdir -p "$mode_repair_dir" || return 1
+    cp "$pinned_dir/asb" "$mode_repair_dir/asb" || return 1
+    chmod 700 "$mode_repair_dir/asb" || return 1
+    printf 'older-version\n' > "$mode_repair_dir/.asb-previous" || return 1
+    output=$( source "$installer"; install_script "$pinned_dir/asb" "$mode_repair_dir" 2>&1 ) || {
+        log_error "Mode repair failed: $output"; return 1;
+    }
+    assert_equals "older-version" "$(cat "$mode_repair_dir/.asb-previous")" || return 1
+    cmp "$pinned_dir/asb" "$mode_repair_dir/asb" || return 1
+    mode=$(stat -c%a "$mode_repair_dir/asb" 2>/dev/null || stat -f%Lp "$mode_repair_dir/asb") || return 1
+    assert_equals "755" "$mode" || return 1
+
+    # Refuses rename(2) in the installer's Perl only, for matching destinations.
+    local fault_lib="${TEST_ENV_ROOT}/fault-lib"
+    mkdir -p "$fault_lib" || return 1
+    cat > "$fault_lib/AsbFailRename.pm" <<'PM' || return 1
+package AsbFailRename;
+use Errno ();
+BEGIN {
+    *CORE::GLOBAL::rename = sub {
+        if ($_[1] =~ $ENV{ASB_TEST_FAIL_RENAME}) { $! = Errno::EACCES(); return 0; }
+        return CORE::rename($_[0], $_[1]);
+    };
+}
+1;
+PM
+
+    # An upgrade that could not be published must not cost the older backup.
+    local unpublished_dir="${TEST_ENV_ROOT}/publish-refused"
+    mkdir -p "$unpublished_dir" || return 1
+    { cat "$pinned_dir/asb"; printf '\n# older build\n'; } > "$unpublished_dir/asb" || return 1
+    chmod 755 "$unpublished_dir/asb" || return 1
+    cp -p "$unpublished_dir/asb" "${TEST_ENV_ROOT}/incumbent-publish-refused" || return 1
+    printf 'older-version\n' > "$unpublished_dir/.asb-previous" || return 1
+    if output=$( source "$installer"; PERL5LIB="$fault_lib" PERL5OPT=-MAsbFailRename ASB_TEST_FAIL_RENAME='/asb$' \
+        install_script "$pinned_dir/asb" "$unpublished_dir" 2>&1 ); then
+        log_error "A refused publication reported success"; return 1
+    fi
+    assert_contains "$output" "Cannot publish prepared installer" || return 1
+    assert_equals "older-version" "$(cat "$unpublished_dir/.asb-previous")" || return 1
+    cmp "${TEST_ENV_ROOT}/incumbent-publish-refused" "$unpublished_dir/asb" || return 1
+
+    # Once the new version is live, a backup that cannot be moved into place
+    # is reported and kept under its temporary name; the install succeeded.
+    local unmoved_dir="${TEST_ENV_ROOT}/backup-move-refused"
+    mkdir -p "$unmoved_dir" || return 1
+    { cat "$pinned_dir/asb"; printf '\n# older build\n'; } > "$unmoved_dir/asb" || return 1
+    chmod 755 "$unmoved_dir/asb" || return 1
+    cp -p "$unmoved_dir/asb" "${TEST_ENV_ROOT}/incumbent-move-refused" || return 1
+    printf 'older-version\n' > "$unmoved_dir/.asb-previous" || return 1
+    output=$( source "$installer"; PERL5LIB="$fault_lib" PERL5OPT=-MAsbFailRename ASB_TEST_FAIL_RENAME='/\.asb-previous$' \
+        install_script "$pinned_dir/asb" "$unmoved_dir" 2>&1 ) || {
+        log_error "A backup move failure failed the published install: $output"; return 1;
+    }
+    assert_contains "$output" "could not move the previous version" || return 1
+    cmp "$pinned_dir/asb" "$unmoved_dir/asb" || return 1
+    assert_equals "older-version" "$(cat "$unmoved_dir/.asb-previous")" || return 1
+    local retained_copies=("$unmoved_dir"/.asb-previous.*)
+    assert_equals "1" "${#retained_copies[@]}" || return 1
+    cmp "${TEST_ENV_ROOT}/incumbent-move-refused" "${retained_copies[0]}" || return 1
+
+    # The count of old copies is only a note: an install directory that cannot
+    # be listed must not fail an upgrade. (Root bypasses the mode; still passes.)
+    local unlisted_dir="${TEST_ENV_ROOT}/unlisted-install-dir"
+    mkdir -p "$unlisted_dir" || return 1
+    { cat "$pinned_dir/asb"; printf '\n# older build\n'; } > "$unlisted_dir/asb" || return 1
+    chmod 755 "$unlisted_dir/asb" || return 1
+    cp -p "$unlisted_dir/asb" "${TEST_ENV_ROOT}/incumbent-unlisted" || return 1
+    chmod 300 "$unlisted_dir" || return 1
+    status=0
+    output=$( source "$installer"; install_script "$pinned_dir/asb" "$unlisted_dir" 2>&1 ) || status=$?
+    chmod 755 "$unlisted_dir" || return 1
+    if [[ $status -ne 0 ]]; then
+        log_error "An unlistable install directory failed the upgrade: $output"; return 1
+    fi
+    cmp "$pinned_dir/asb" "$unlisted_dir/asb" || return 1
+    cmp "${TEST_ENV_ROOT}/incumbent-unlisted" "$unlisted_dir/.asb-previous" || return 1
+
     local contention_dir="${TEST_ENV_ROOT}/kernel-lock-contention"
     mkdir -p "$contention_dir" || return 1
     cp -p "$pinned_dir/asb" "$contention_dir/asb" || return 1
